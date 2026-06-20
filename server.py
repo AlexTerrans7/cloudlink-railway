@@ -1,61 +1,42 @@
 import os
 import asyncio
+import threading
 import logging
-import websockets
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from cloudlink import server
 from cloudlink.server.protocols import clpv4
 
-PORT = int(os.environ.get("PORT", 3000))
-
-# Suppress the noisy HEAD request errors - they don't affect WS clients
+# ── Silence the HEAD-request spam (cosmetic, belt-and-suspenders) ──
 logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.INFO)
 
-async def process_request(connection, request):
-    """Respond to Render's health checks with HTTP 200."""
-    try:
-        method = request.method
-    except AttributeError:
-        return None
-    
-    if method in ("HEAD", "GET"):
-        headers = {}
-        try:
-            headers = dict(request.headers)
-        except Exception:
-            pass
-        
-        if headers.get("upgrade", "").lower() != "websocket":
-            # Plain HTTP health check — respond OK
-            from websockets.http11 import Response
-            from websockets.datastructures import Headers
-            response = Response(
-                200, "OK",
-                Headers([("Content-Length", "2")]),
-                b"OK"
-            )
-            await connection.send_response(response)
-            return response
-    
-    return None  # Real WebSocket connection — let it through
+WS_PORT   = 3000                                      # CloudLink always uses 3000
+HTTP_PORT = int(os.environ.get("PORT", 8080))         # Render health-check port
 
-async def run():
-    cl_server = server()
-    clpv4(cl_server)
-    
-    # Start CloudLink but intercept the underlying websockets.serve call
-    # by monkey-patching the process_request into it
-    original_run = cl_server.run.__func__ if hasattr(cl_server.run, '__func__') else None
-    
-    # Directly use websockets.serve with CloudLink's handler + our health check
-    async with websockets.serve(
-        cl_server.handle,           # CloudLink's internal handler
-        "0.0.0.0",
-        PORT,
-        process_request=process_request,
-    ):
-        logging.info(f"✅ CloudLink + health check running on port {PORT}")
-        await asyncio.Future()
+# ── Tiny HTTP server just for Render's health checks ──────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
-if __name__ == "__main__":
-    asyncio.run(run())
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass  # keep logs clean
+
+def start_health_server():
+    httpd = HTTPServer(("0.0.0.0", HTTP_PORT), HealthHandler)
+    httpd.serve_forever()
+
+# ── Start health check in background thread ────────────────────────
+t = threading.Thread(target=start_health_server, daemon=True)
+t.start()
+logging.info(f"Health check HTTP server running on port {HTTP_PORT}")
+
+# ── Start CloudLink (blocking) ─────────────────────────────────────
+cl = server()
+clpv4(cl)
+cl.run(ip="0.0.0.0", port=WS_PORT)
